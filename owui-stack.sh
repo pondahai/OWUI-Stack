@@ -8,6 +8,7 @@ set -euo pipefail
 #   PORT_SXNG=8888               # SearXNG 埠（JSON: /search?format=json&q=...）
 #   MCP_BROWSER_CHANNEL=chromium # 強制 Playwright 走 chromium（預設 chrome）
 #   DEBUG_PW=1|pattern           # 例如 1 → 'pw:*'；或自訂 'pw:browser*'
+#   USER_AGENT=...               # 給外部抓取工具使用（可選）
 # =================================================================================================
 
 # ---------- 可調參數 ----------
@@ -42,7 +43,7 @@ ensure_basics(){
   sudo apt-get update -y
   sudo apt-get install -y \
     curl git ca-certificates python3-venv python3-pip build-essential jq \
-    iproute2 procps xvfb \
+    iproute2 procps xvfb ffmpeg \
     libxml2-dev libxslt1-dev zlib1g-dev libffi-dev libssl-dev
 }
 
@@ -95,9 +96,9 @@ ensure_openwebui(){
   deactivate
 }
 
-# ----------------- SearXNG 安裝（Git 來源 + 依賴 + 靜音健檢） -----------------
+# ----------------- SearXNG 安裝（Git 來源 + 依賴 + 健檢） -----------------
 ensure_searxng(){
-  banner "建立/啟用 venv（SearXNG）並安裝套件（Git 來源 + 前置依賴）"
+  banner "建立/啟用 venv（SearXNG）並安裝套件（Git 來源 + 前置依賴 + gunicorn）"
   mkdir -p "$SXNG_CFG_DIR"
   local PY=python3
   command -v python3.11 >/dev/null 2>&1 && PY=python3.11
@@ -106,13 +107,13 @@ ensure_searxng(){
   # shellcheck disable=SC1091
   source "$VENV_SXNG/bin/activate"
   pip install -U pip wheel setuptools "setuptools_scm[toml]" \
-    PyYAML Babel Jinja2 "Werkzeug>=3.0" lxml
+    PyYAML Babel Jinja2 "Werkzeug>=3.0" lxml gunicorn
   # 移除可能誤裝的同名 MCP 套件
   pip uninstall -y searxng >/dev/null 2>&1 || true
   # 安裝 SearXNG 本體 + redis client
   pip install "git+https://github.com/searxng/searxng.git#egg=searxng" redis
 
-  # ---- 健檢：帶「極簡且完全靜音」的臨時設定，且不真正 import（避免引擎初始化噪音） ----
+  # ---- 健檢：帶「極簡且完全靜音」的臨時設定，且不真正 import 引擎 ----
   TMP_SXNG_CFG=""
   if [ -f "$SXNG_CFG" ]; then
     export SEARXNG_SETTINGS_PATH="$SXNG_CFG"
@@ -249,6 +250,7 @@ write_mcpo_config(){
   ENV_OBJ="{\"PATH\":\"${NODE_DIR}:${PATH}\",\"HOME\":\"${HOME}\",\"NVM_DIR\":\"${NVM_DIR:-$HOME/.nvm}\""
   [ -n "$MCP_BROWSER_CHANNEL" ] && ENV_OBJ="${ENV_OBJ},\"MCP_BROWSER_CHANNEL\":\"${MCP_BROWSER_CHANNEL}\""
   [ -n "$DEBUG_PATTERN" ] && ENV_OBJ="${ENV_OBJ},\"DEBUG\":\"${DEBUG_PATTERN}\""
+  [ -n "${USER_AGENT:-}" ] && ENV_OBJ="${ENV_OBJ},\"USER_AGENT\":\"${USER_AGENT}\""
   ENV_OBJ="${ENV_OBJ}}"
 
   cat > "$MCPO_CFG" <<JSON
@@ -312,9 +314,18 @@ start_searxng_bg(){
   ss -lntp | grep -q ":${PORT_SXNG}\b" && { echo "PORT_SXNG=${PORT_SXNG} 已被佔用"; exit 1; }
   [ -f "$PID_SXNG" ] && ps -p "$(cat "$PID_SXNG")" >/dev/null 2>&1 && kill "$(cat "$PID_SXNG")" || true
   rotate_log "$LOG_SXNG"
-  SEARXNG_SETTINGS_PATH="$SXNG_CFG" \
-  nohup "$VENV_SXNG/bin/gunicorn" --timeout 120 --graceful-timeout 20 --keep-alive 2 \
-        -w 2 -b 127.0.0.1:"$PORT_SXNG" searx.webapp:app > "$LOG_SXNG" 2>&1 &
+
+  local GUNI_BIN="$VENV_SXNG/bin/gunicorn"
+  if [ ! -x "$GUNI_BIN" ]; then
+    echo "WARN: $GUNI_BIN 不存在，改用 python -m gunicorn 啟動"
+    nohup "$VENV_SXNG/bin/python3" -m gunicorn --timeout 120 --graceful-timeout 20 --keep-alive 2 \
+          -w 2 -b 127.0.0.1:"$PORT_SXNG" searx.webapp:app > "$LOG_SXNG" 2>&1 &
+  else
+    SEARXNG_SETTINGS_PATH="$SXNG_CFG" \
+    nohup "$GUNI_BIN" --timeout 120 --graceful-timeout 20 --keep-alive 2 \
+          -w 2 -b 127.0.0.1:"$PORT_SXNG" searx.webapp:app > "$LOG_SXNG" 2>&1 &
+  fi
+
   echo $! > "$PID_SXNG"; sleep 2
   echo "SearXNG PID: $(cat "$PID_SXNG")"
   echo "SearXNG HTML: http://127.0.0.1:${PORT_SXNG}/"
@@ -410,6 +421,7 @@ SearXNG 獨立控制：
   PORT_SXNG=8888               # SearXNG 埠
   MCP_BROWSER_CHANNEL=chromium  # 強制 Playwright 走 chromium
   DEBUG_PW=1|pattern           # 1=‘pw:*’，或自訂如‘pw:browser*’
+  USER_AGENT=...               # （可選）給外部抓取工具使用
 
 USAGE
 }
@@ -436,4 +448,3 @@ case "$cmd" in
   searx-logs)    logs_searxng ;;
   *)             usage ;;
 esac
-
